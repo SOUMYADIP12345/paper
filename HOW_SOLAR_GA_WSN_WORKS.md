@@ -7,7 +7,7 @@
 
 ## 1. The Big Picture (the head-to-head match)
 
-This is the **main** file in the project. The other two files (`ga_only.py` and `leach_only.py`) are spin-offs that run just **one** strategy each. This combined file runs **both strategies side by side** in the same simulation, so you can directly compare them.
+This is the **main** file in the project. The companion file (`ga_only.py`) is a spin-off that runs just the GA strategy on its own. This combined file runs **both strategies side by side** — the Solar-Aware GA Multi-Sink protocol **and** the LEACH baseline (LEACH is implemented directly inside this file, not in a separate script) — in the same simulation, so you can directly compare them.
 
 Think of it like a **boxing match**:
 
@@ -35,9 +35,12 @@ Two complete simulations are run, one after the other:
 
 Because both use the same random seed and the same physical setup, the comparison is fair.
 
-> If you want a deep explanation of each strategy on its own, see:
-> - **`HOW_LEACH_ONLY_WORKS.md`** for the LEACH baseline
+> If you want a deep explanation of the GA strategy on its own, see:
 > - **`HOW_GA_ONLY_WORKS.md`** for the Solar-Aware GA Multi-Sink approach
+> - **`SOLAR_GA_WSN_TECHNICAL_DEEP_DIVE.md`** for a formula-by-formula walkthrough
+>
+> The LEACH baseline is a short, self-contained function inside
+> `solar_ga_wsn.py` (`simulate_round_leach`); it has no separate file.
 
 ---
 
@@ -52,11 +55,11 @@ Most simple protocols (like LEACH) have **one drain point**: every team leader s
 Picking the super-leader carefully matters. This protocol scores candidate super-leaders on:
 
 - **35%** — How full is the battery?
-- **30%** — Is the sun shining on it right now?
+- **30%** — How much sun is *this* sensor harvesting right now? (Each sensor has its own fixed panel quality — full sun vs. partial shade — so this differs from sensor to sensor.)
 - **20%** — Is it geographically central among the team leaders it would serve?
 - **15%** — Is it close to the Base Station?
 
-A sensor that is **half full but currently bathed in sunshine** can outscore a fully charged sensor sitting in shade. That's the "solar-aware" twist — it doesn't just look at *now*, it looks at what's about to happen.
+A sensor that is **half full but sitting in full sun** can outscore a fully charged sensor stuck in shade. That's the "solar-aware" twist — it doesn't just look at *now*, it looks at what's about to happen. It only bites because sensors genuinely harvest different amounts (a shared "is it daytime?" value alone couldn't tell two candidates apart).
 
 ---
 
@@ -116,7 +119,7 @@ When you run the file, it asks you setup questions (or you can use built-in defa
 ```
 
 ### Image files
-- **`comparison_results.png`** — a multi-panel graph image showing both protocols overlaid: lifetime, residual energy, cumulative deaths, energy balance, dynamic leader counts, and the solar harvest cycle.
+- **`results_comparison.png`** — a multi-panel graph image showing both protocols overlaid: lifetime, residual energy, cumulative deaths, energy balance, dynamic leader counts, and the solar harvest cycle.
 - **`topology_snapshots/`** folder — paired snapshots from both protocols every 50 rounds. The GA snapshots show the 3-tier paths (with relay arrows from team leaders to super leaders) and are flagged "MS-USED" or "MS-SKIPPED" depending on whether the super-leader tier was needed that round.
 
 ---
@@ -167,11 +170,11 @@ In all these cases, **batteries are precious** and **replacing them is expensive
 | **LEACH** | The classic random-pick baseline protocol |
 | **GA (Genetic Algorithm)** | Evolution-inspired optimization used to pick the best leaders |
 | **Multi-Sink** | The "many drain points" idea — using super-leaders as extra collection points |
-| **Solar-Aware** | Considering current sunshine, not just battery level, when picking leaders |
+| **Solar-Aware** | Considering each sensor's own current sunshine (it has its own panel quality), not just battery level, when picking leaders |
 | **Round** | One full cycle of the simulation |
 | **Packet** | A bundle of data sent over the radio |
 | **Path A / Path B** | Direct-to-Base or via-super-leader |
 
 ---
 
-*Bottom line: this file is the **head-to-head championship bout**. The two spin-off files (`ga_only.py` and `leach_only.py`) are the individual training videos. Read those for depth on each strategy, then run this one to see who wins.*
+*Bottom line: this file is the **head-to-head championship bout** — the Solar-Aware GA Multi-Sink protocol versus the LEACH baseline, both run in the same script. The spin-off file `ga_only.py` is the individual training video for the GA strategy. Read that (and the technical deep dive) for depth, then run this one to see who wins.*

@@ -4,10 +4,14 @@
               for Wireless Sensor Assisted IoT Networks
                       ---  GA-ONLY  RUNNER  ---
 ================================================================================
-  This file is the GA-only spin-off of `solar_ga_wsn`.
-  Behaviour, formulas, GA logic, MS-CH election, and snapshot output are
-  IDENTICAL to the GA branch of the original combined script. LEACH has been
-  removed so this script outputs only the GA-protocol results.
+  This file is the GA-only spin-off of `solar_ga_wsn`. LEACH has been removed
+  so this script outputs only the GA-protocol results.
+
+  It shares the same core formulas, GA logic, MS-CH election, and snapshot
+  output as the GA branch of the combined script, with ONE intentional
+  addition: the GA fitness function here includes a 5th "BS-proximity" term
+  (bs_score) that rewards CH sets with members close enough to reach the base
+  station directly (PATH A). The combined-script fitness uses 4 terms.
 
   Architecture (3-Tier):
     Tier 1 -> Sensor nodes : sense data, send to nearest CH
@@ -91,7 +95,7 @@ def get_user_input() -> dict:
     d_dist   = ask("Max distance (m) for CH->BS direct",
                    round(field * 0.75), float, 10)
     d_nrg    = ask("Min battery fraction for CH->BS direct (0.0-1.0)",
-                   round(e_init / BATTERY_MAX * 0.6, 2), float, 0.0, 1.0)
+                   0.4, float, 0.0, 1.0)
 
     print("\n  -- Topology Snapshots --")
     snap_every = ask("Save topology image every N rounds (0 = off)",
@@ -157,6 +161,12 @@ BATTERY_MAX    = 2.0
 COMM_RANGE_PCT = 0.4
 D0             = math.sqrt(E_AMP / E_MP)
 MS_REELECT_THR = 0.15
+# Per-node solar harvesting efficiency range. Each node draws a fixed value
+# in [SOLAR_EFF_MIN, SOLAR_EFF_MAX] at creation, modelling differences in
+# panel orientation, shading and dust. This spatial heterogeneity is what
+# makes the "solar-aware" score actually differentiate one node from another.
+SOLAR_EFF_MIN  = 0.6
+SOLAR_EFF_MAX  = 1.0
 
 
 # ==============================================================================
@@ -166,9 +176,10 @@ MS_REELECT_THR = 0.15
 class Node:
     __slots__ = ("id", "x", "y", "energy", "alive", "role",
                  "assigned_ch", "assigned_ms", "goes_direct",
-                 "packets_sent", "_cfg", "_dist_bs")
+                 "packets_sent", "_cfg", "_dist_bs", "solar_eff")
 
-    def __init__(self, node_id: int, x: float, y: float, cfg: dict):
+    def __init__(self, node_id: int, x: float, y: float, cfg: dict,
+                 solar_eff: float = 1.0):
         self.id           = node_id
         self.x            = x
         self.y            = y
@@ -181,6 +192,8 @@ class Node:
         self.packets_sent = 0
         self._cfg         = cfg
         self._dist_bs     = math.hypot(cfg["BS_X"] - x, cfg["BS_Y"] - y)
+        # Fixed per-node harvesting efficiency (panel orientation / shading).
+        self.solar_eff    = solar_eff
 
     def distance_to(self, x: float, y: float) -> float:
         return math.hypot(self.x - x, self.y - y)
@@ -226,9 +239,13 @@ class Node:
         return self.alive
 
     def harvest_solar(self, solar_rate_now: float) -> None:
+        # solar_rate_now is the network-wide daylight rate; scale it by this
+        # node's own panel efficiency so shaded / poorly-oriented nodes
+        # genuinely harvest less than well-placed ones.
         if solar_rate_now <= 0:
             return
-        harvest = max(0.0, solar_rate_now + random.gauss(0, solar_rate_now * 0.05))
+        rate    = solar_rate_now * self.solar_eff
+        harvest = max(0.0, rate + random.gauss(0, rate * 0.05))
         self.energy = min(self.energy + harvest, BATTERY_MAX)
 
     def reset_role(self) -> None:
@@ -239,7 +256,13 @@ class Node:
 
     @property
     def energy_fraction(self) -> float:
-        return min(self.energy / BATTERY_MAX, 1.0)
+        # Fraction of INITIAL energy remaining. With solar harvesting this can
+        # exceed 1.0 (battery caps at BATTERY_MAX = 4x E_INITIAL); callers that
+        # need a [0, 1] value clamp with min(..., 1.0).
+        # Uses E_INITIAL to stay consistent with the GA fitness energy term
+        # (which also normalises by E_INITIAL) and with the documented design
+        # in SOLAR_GA_WSN_TECHNICAL_DEEP_DIVE.md.
+        return self.energy / self._cfg["E_INITIAL"]
 
     def __repr__(self) -> str:
         return (f"Node({self.id}, {self.role}, "
@@ -271,6 +294,7 @@ class World:
     alive_xy:   np.ndarray = dc_field(default_factory=lambda: np.empty((0, 2)))
     alive_e:    np.ndarray = dc_field(default_factory=lambda: np.empty(0))
     alive_dbs:  np.ndarray = dc_field(default_factory=lambda: np.empty(0))
+    alive_seff: np.ndarray = dc_field(default_factory=lambda: np.empty(0))
     id_to_idx:  Dict[int, int] = dc_field(default_factory=dict)
 
     def refresh(self) -> None:
@@ -280,6 +304,7 @@ class World:
             self.alive_xy   = np.empty((0, 2))
             self.alive_e    = np.empty(0)
             self.alive_dbs  = np.empty(0)
+            self.alive_seff = np.empty(0)
             self.id_to_idx  = {}
             return
         self.alive_idx = np.fromiter((n.id for n in alive), dtype=np.int32,
@@ -289,6 +314,8 @@ class World:
                                      dtype=np.float64, count=len(alive))
         self.alive_dbs = np.fromiter((n._dist_bs for n in alive),
                                      dtype=np.float64, count=len(alive))
+        self.alive_seff = np.fromiter((n.solar_eff for n in alive),
+                                      dtype=np.float64, count=len(alive))
         self.id_to_idx = {int(nid): i for i, nid in enumerate(self.alive_idx)}
 
 
@@ -332,10 +359,11 @@ def _evaluate_population(pop: List["Chromosome"],
             c.fitness = 0.0
         return
 
-    alive_xy = world.alive_xy
-    alive_e  = world.alive_e
-    S        = alive_xy.shape[0]
-    id_map   = world.id_to_idx
+    alive_xy   = world.alive_xy
+    alive_e    = world.alive_e
+    alive_seff = world.alive_seff
+    S          = alive_xy.shape[0]
+    id_map     = world.id_to_idx
     K        = num_chs
     P        = len(pending)
 
@@ -354,7 +382,15 @@ def _evaluate_population(pop: List["Chromosome"],
     e_score = np.minimum(ch_e.sum(axis=1) / (K * cfg["E_INITIAL"]), 1.0)
 
     if cfg["MAX_HARVEST"] > 0:
-        solar_fraction = solar_now / cfg["MAX_HARVEST"]
+        daylight = solar_now / cfg["MAX_HARVEST"]        # 0.0 night, 1.0 noon
+
+        # NODE-SPECIFIC solar: scale the shared daylight level by the average
+        # panel efficiency of THIS chromosome's CHs. Because solar_eff varies
+        # per node, this term now differs between candidate CH sets and can
+        # actually change which chromosome wins (previously it was a constant
+        # offset that had no effect on ranking).
+        ch_seff        = alive_seff[gene_idx]            # (P, K)
+        solar_fraction = daylight * ch_seff.mean(axis=1)  # per-chromosome
 
         energy_fraction = np.minimum(
             ch_e.mean(axis=1) / cfg["E_INITIAL"],
@@ -566,7 +602,10 @@ def _solar_aware_score(ch: Node, peers: List[Node], cfg: dict,
                        solar_now: float) -> float:
     bat = min(ch.energy_fraction, 1.0)
     if cfg["MAX_HARVEST"] > 0:
-        solar = solar_now / cfg["MAX_HARVEST"]
+        # Node-specific: shared daylight level scaled by THIS candidate's own
+        # panel efficiency, so the solar term genuinely differentiates the
+        # relay CHs competing to become the MS-CH.
+        solar = (solar_now / cfg["MAX_HARVEST"]) * ch.solar_eff
     else:
         solar = 0.5
 
@@ -816,12 +855,18 @@ def create_nodes(cfg: dict, seed=None) -> List[Node]:
         random.seed(seed)
         np.random.seed(seed)
 
-    return [Node(
+    nodes = [Node(
         i,
         random.uniform(0, cfg["FIELD"]),
         random.uniform(0, cfg["FIELD"]),
         cfg
     ) for i in range(cfg["NUM_NODES"])]
+    # Assign each node a fixed solar-harvesting efficiency. Drawn AFTER all
+    # positions so the field topology is byte-for-byte identical to before;
+    # this heterogeneity is what makes the solar-aware selection meaningful.
+    for n in nodes:
+        n.solar_eff = random.uniform(SOLAR_EFF_MIN, SOLAR_EFF_MAX)
+    return nodes
 
 
 def run_simulation(cfg: dict):
@@ -944,7 +989,12 @@ def plot_results(ga_stats, ga_fd, cfg) -> None:
     # 6. Solar harvest cycle
     ax = axes[1, 2]
     hours   = np.linspace(0, 48, 500)
-    harvest = [cfg["MAX_HARVEST"] * max(0, math.sin(math.pi * (h % 24) / 12))
+    # Reuse the SAME formula as solar_rate_for_round() so the plotted curve
+    # can never drift from the model actually used in the simulation.
+    # (Bug fix: the "-6" phase shift was previously missing here, which made
+    #  the plot peak at 06:00 instead of noon.)
+    harvest = [cfg["MAX_HARVEST"] * max(0.0,
+                                        math.sin(math.pi * ((h % 24) - 6) / 12))
                for h in hours]
     ax.fill_between(hours, harvest, alpha=0.25, color="orange")
     ax.plot(hours, harvest, color="darkorange", lw=2)
