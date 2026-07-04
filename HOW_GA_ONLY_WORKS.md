@@ -64,7 +64,7 @@ Think of it like breeding the perfect racehorse:
 The computer makes 30 different **random guesses** ("what if these 5 sensors were the leaders? What if these other 5 were?"). Each guess is like a candidate team of leaders.
 
 ### Step 2 — Score each guess
-Each candidate team is graded on four things, like a school report card:
+Each candidate team is graded on five things, like a school report card:
 
 | Grade | What it measures | Why it matters |
 |---|---|---|
@@ -72,8 +72,9 @@ Each candidate team is graded on four things, like a school report card:
 | **Solar** | Are they getting good sunlight? | Recharging keeps them alive |
 | **Coverage** | Can most workers reach a leader nearby? | Closer = cheaper whispers |
 | **Spread** | Are the leaders well-spaced across the field? | No clumping in one corner |
+| **BS-proximity** | Are some leaders close enough to reach the Base Station directly? | Fewer expensive relays needed |
 
-The four grades are blended into one final score.
+The five grades are blended into one final score.
 
 ### Step 3 — Survival of the fittest
 - The **best two** candidate teams automatically advance to the next round (called "elitism" — the champions live on).
@@ -92,12 +93,12 @@ This whole evolution happens **every single round** because batteries drain, the
 
 The "smart" part of this protocol — what makes it special — is that it doesn't just look at **current** battery levels. It also considers:
 
-- **Is the sun shining right now?** (the simulation models a 24-hour day/night cycle, like a sine wave)
-- **Will this sensor recharge soon?**
+- **How much sun is this particular sensor getting?** The simulation models a 24-hour day/night cycle (like a sine wave), **and** gives each sensor its own fixed "panel quality" — some sit in full sun, others are partly shaded or badly angled, so they recharge at different rates.
+- **Will this sensor recharge quickly?**
 - **Is it physically central** to its peers (so others don't have to shout far)?
 - **Is it close to the Base Station?**
 
-A sensor with a half-empty battery but **strong sunlight** might be a better choice than a sensor with a fuller battery sitting in the shade. That's the "solar-aware" insight.
+A sensor with a half-empty battery sitting in **full sun** might be a better choice than a sensor with a fuller battery stuck in the **shade** — because the sunny one will top itself back up. That's the "solar-aware" insight, and it only works because different sensors genuinely harvest different amounts.
 
 ---
 

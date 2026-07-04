@@ -45,7 +45,9 @@ leaves off.
 | `d₀` | Crossover distance (free-space ↔ multi-path) | √(E_amp/E_mp) ≈ 87.7 m |
 | `E_init` | Initial battery of every node | 0.5 J |
 | `BATTERY_MAX` | Hard cap on battery (with solar) | 2.0 J |
-| `MAX_HARVEST` | Peak solar rate per round | 0.002 J |
+| `MAX_HARVEST` | Peak network-wide solar rate per round | 0.002 J |
+| `solar_eff` | Per-node harvesting efficiency (panel/shade), fixed at creation | uniform in [0.6, 1.0] |
+| `SOLAR_EFF_MIN`/`MAX` | Bounds of the per-node `solar_eff` draw | 0.6 / 1.0 |
 | `COMM_RANGE_PCT` | Comm range as fraction of field | 0.40 |
 | `MS_REELECT_THR` | Battery fraction below which an MS-CH is replaced | 0.15 |
 | `CH_PERCENT` | Target fraction of alive nodes that become CHs | 0.10 |
@@ -184,11 +186,16 @@ This curve:
 - Rises smoothly to **1.0** at noon
 - Falls smoothly back to 0 at sunset
 
-Each node also adds **5% Gaussian noise** per round so nodes don't all
-recharge identically (mimicking shade, dust, panel orientation):
+`solar(round)` is the **network-wide daylight level** — it is the same for
+everyone. What differs **per node** is a fixed **harvesting efficiency**
+`solar_eff ∈ [0.6, 1.0]`, drawn once at creation. It models a node's panel
+orientation, shading and dust: a node in a shaded corner permanently harvests
+less than a well-placed one. Each round a node's actual gain is its own rate
+plus 5% Gaussian noise:
 
 ```
-harvest_actual = max(0, solar(round) + N(0, 0.05 · solar(round)))
+rate           = solar(round) · solar_eff          (node-specific)
+harvest_actual = max(0, rate + N(0, 0.05 · rate))
 ```
 
 Battery is then capped at `BATTERY_MAX = 2.0 J` so a node never
@@ -205,18 +212,31 @@ def solar_rate_for_round(round_num: int, max_harvest: float) -> float:
 def harvest_solar(self, solar_rate_now: float) -> None:
     if solar_rate_now <= 0:
         return
-    harvest = max(0.0, solar_rate_now + random.gauss(0, solar_rate_now * 0.05))
+    rate    = solar_rate_now * self.solar_eff        # node-specific
+    harvest = max(0.0, rate + random.gauss(0, rate * 0.05))
     self.energy = min(self.energy + harvest, BATTERY_MAX)
+
+# solar_eff is assigned once, in create_nodes():
+for n in nodes:
+    n.solar_eff = random.uniform(SOLAR_EFF_MIN, SOLAR_EFF_MAX)   # [0.6, 1.0]
 ```
 
 ### Why this shape?
 
 A real solar panel's output roughly follows a sine of solar elevation
 angle. We use a *half*-sine spanning 12 hours so the integral matches
-an idealised dawn-to-dusk cycle. The 5% noise is added so the GA's
-"solar-aware" score actually distinguishes nodes — without noise, every
-alive node would harvest the exact same amount and the score would be a
-constant.
+an idealised dawn-to-dusk cycle.
+
+### Why per-node `solar_eff` (and not just the shared curve)?
+
+This is the fix for a subtle but important flaw. The daylight level
+`solar(round)` is identical for every node, so on its own it can **never**
+tell two candidate nodes apart — added to competing candidates it is just a
+constant offset that cannot change a ranking. Giving each node a fixed
+`solar_eff` makes harvesting **spatially heterogeneous**: some nodes really
+are better solar sites than others. That is what lets the "solar-aware" score
+genuinely prefer one node over another (see Formulas 7 and 8). The extra 5%
+noise only adds small round-to-round jitter on top.
 
 ---
 
@@ -351,23 +371,32 @@ e_score = np.minimum(ch_e.sum(axis=1) / (K * cfg["E_INITIAL"]), 1.0)
 ### 8.2 Solar Score (25%) — the "true solar-aware" piece
 
 ```
-S_score = 0.5 · (solar_now / MAX_HARVEST) + 0.5 · (avg_E(ch) / E_init)
+daylight = solar_now / MAX_HARVEST                         (shared, 0→1)
+S_score  = 0.5 · daylight · avg(solar_eff of chosen CHs)
+         + 0.5 · (avg_E(ch) / E_init)
 ```
 
-**This is the key novelty.** Half the score depends on **how bright the
-sun is right now** (independent of who you are), and half on the average
-battery of the picked CHs. So:
+**This is the key novelty.** The first half is a **node-specific** solar term:
+the shared daylight level multiplied by the *average panel efficiency of the
+CHs this chromosome actually picked*. Because `solar_eff` varies per node,
+this value **differs between candidate teams**, so it genuinely influences
+which team wins. (Earlier this term used only `daylight`, which is identical
+for all candidates and therefore could not change the ranking — a constant
+offset. Scaling by the picked nodes' `solar_eff` is what fixes that.)
 
-- At **night** (`solar_now = 0`), `S_score = 0.5 · battery_avg` — falls
-  back to a battery-only score.
-- At **noon** (`solar_now = MAX_HARVEST`), a fully charged CH set scores
-  `S_score = 0.5 · 1 + 0.5 · 1 = 1.0` — the "perfect" daytime team.
-- A CH set with weak batteries but full sun still gets a daytime boost,
-  reflecting "they're recharging, they'll survive".
+- At **night** (`daylight = 0`), `S_score = 0.5 · battery_avg` — falls back
+  to a battery-only score.
+- At **noon**, a team of fully charged CHs sitting in **good sun**
+  (`solar_eff ≈ 1`) scores near `1.0`; an equally charged team stuck in
+  **shade** (`solar_eff ≈ 0.6`) scores lower and is less likely to be chosen.
+- A team with weak batteries but excellent solar sites still gets a daytime
+  boost, reflecting "they're recharging fast, they'll survive".
 
 ```python
 if cfg["MAX_HARVEST"] > 0:
-    solar_fraction  = solar_now / cfg["MAX_HARVEST"]
+    daylight        = solar_now / cfg["MAX_HARVEST"]          # shared 0→1
+    ch_seff         = alive_seff[gene_idx]                    # (P, K) per-node
+    solar_fraction  = daylight * ch_seff.mean(axis=1)         # per-chromosome
     energy_fraction = np.minimum(ch_e.mean(axis=1) / cfg["E_INITIAL"], 1.0)
     s_score = 0.5 * solar_fraction + 0.5 * energy_fraction
 else:
@@ -453,11 +482,16 @@ score(ch) = 0.35 · Battery + 0.30 · Solar + 0.20 · Centrality + 0.15 · BS-cl
 
 ```
 Battery       = min(ch.energy / E_init, 1.0)
-Solar         = solar_now / MAX_HARVEST                       (else 0.5)
+Solar         = (solar_now / MAX_HARVEST) · ch.solar_eff      (else 0.5)
 Centrality    = 1 - min(avg_d_to_peers / (FIELD · √2), 1)
 BS-closeness  = 1 - min(d_to_BS / max_d, 1),
                 where max_d = √(FIELD² + BS_Y²)
 ```
+
+Note the `Solar` term is **node-specific**: the shared daylight level is
+scaled by *this candidate's own* `solar_eff`, so among the relay CHs
+competing to become the MS-CH the solar component actually differentiates
+them (rather than adding the same constant to everyone).
 
 ### Code
 
@@ -466,7 +500,7 @@ def _solar_aware_score(ch, peers, cfg, solar_now):
     bat = min(ch.energy_fraction, 1.0)
 
     if cfg["MAX_HARVEST"] > 0:
-        solar = solar_now / cfg["MAX_HARVEST"]
+        solar = (solar_now / cfg["MAX_HARVEST"]) * ch.solar_eff   # node-specific
     else:
         solar = 0.5
 
@@ -803,8 +837,9 @@ A round is the heartbeat of the simulation. The function
 `simulate_round_ga` runs through these 12 steps in order:
 
 ### Step 1 — Solar harvest
-Compute `solar_now` once per round (same value for every node, plus 5%
-per-node noise inside `harvest_solar`). Every alive node tops up.
+Compute the shared daylight rate `solar_now` once per round. Every alive node
+tops up by `solar_now · solar_eff` (its own fixed panel efficiency) plus 5%
+noise, so better-sited nodes recharge faster.
 
 ### Step 2 — Reset roles
 Yesterday's CHs and MS-CHs revert to plain sensors. Assignment fields
