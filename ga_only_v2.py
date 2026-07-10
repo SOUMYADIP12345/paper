@@ -25,6 +25,7 @@
 import math
 import os
 import random
+import time                       # v2: per-round CH-election timing
 from dataclasses import dataclass, field as dc_field
 from typing import List, Optional, Tuple, Dict
 
@@ -37,6 +38,11 @@ import matplotlib.lines as mlines
 plt.switch_backend("Agg")
 
 SNAPSHOT_DIR = "topology_snapshots"
+
+# v2: optional convergence recorder. When set to a Python list, run_ga_ch_election
+# appends its best-fitness-so-far after every generation, letting us plot the GA's
+# convergence curve. Left as None during normal runs => zero overhead.
+_CONV_SINK: Optional[list] = None
 
 
 # ==============================================================================
@@ -131,6 +137,58 @@ def get_user_input() -> dict:
     }
 
 
+def default_config(**overrides) -> dict:
+    """
+    Non-interactive default configuration for the GA-only v2 runner (Colab / CI).
+    Pass keyword overrides, e.g. default_config(NUM_NODES=200, MC_SEEDS=5).
+
+    Includes all v2 additions (realistic radio + realistic solar + ablation +
+    Monte-Carlo) alongside the original GA-only parameters. The DIRECT_DIST
+    default keeps the GA-only file's wider 0.75*FIELD reach.
+    """
+    field = 100
+    cfg = {
+        "FIELD"         : field,
+        "NUM_NODES"     : 50,
+        "BS_X"          : field / 2,
+        "BS_Y"          : field + 20,
+        "NUM_ROUNDS"    : 300,
+        "CH_PERCENT"    : 0.10,
+        "RELAYS_PER_MS" : 4,
+        "E_INITIAL"     : 0.5,
+        "MAX_HARVEST"   : 0.002,
+        "PACKET_SIZE"   : 4000,
+        "GA_POP"        : 30,
+        "GA_GEN"        : 50,
+        "GA_MUT"        : 0.1,
+        "GA_CX"         : 0.8,
+        "DIRECT_DIST"   : round(field * 0.75),
+        "DIRECT_NRG"    : 0.4,
+        "SNAPSHOT_EVERY": 50,
+
+        # ---- v2: realistic radio / MAC (Drawback 3) --------------------------
+        "PACKET_LOSS"    : 0.05,      # base per-TX drop prob (scaled by distance)
+        "MAX_RETX"       : 2,         # ARQ retransmissions per dropped packet
+        "IDLE_ENERGY"    : 5.0e-5,    # idle-listen drain per alive node per round
+        "SENSING_ENERGY" : 2.0e-5,    # sensing/CPU drain per alive node per round
+
+        # ---- v2: realistic solar (Drawback 4) --------------------------------
+        "SOLAR_MODEL"    : "realistic",   # "clearsky" or "realistic"
+        "CLOUD_PROB"     : 0.30,
+        "CLOUD_MIN"      : 0.15,
+        "SEASON_AMP"     : 0.30,
+        "SOLAR_TRACE"    : None,          # optional CSV of measured harvest rates
+
+        # ---- v2: solar-awareness ablation (Drawback 5) -----------------------
+        "USE_SOLAR_TERM" : True,
+
+        # ---- v2: Monte-Carlo repetition (Drawback 1) -------------------------
+        "MC_SEEDS"       : 15,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
 def get_num_chs(alive_count: int, cfg: dict) -> int:
     """Dynamic CH count - recalculated every round."""
     if alive_count <= 0:
@@ -176,7 +234,9 @@ SOLAR_EFF_MAX  = 1.0
 class Node:
     __slots__ = ("id", "x", "y", "energy", "alive", "role",
                  "assigned_ch", "assigned_ms", "goes_direct",
-                 "packets_sent", "_cfg", "_dist_bs", "solar_eff")
+                 "packets_sent", "_cfg", "_dist_bs", "solar_eff",
+                 # v2 realism counters
+                 "delivered", "packets_delivered")
 
     def __init__(self, node_id: int, x: float, y: float, cfg: dict,
                  solar_eff: float = 1.0):
@@ -194,6 +254,10 @@ class Node:
         self._dist_bs     = math.hypot(cfg["BS_X"] - x, cfg["BS_Y"] - y)
         # Fixed per-node harvesting efficiency (panel orientation / shading).
         self.solar_eff    = solar_eff
+        # v2: outcome of the most recent transmit() and a lifetime counter of
+        # successfully delivered packets, used to compute Packet Delivery Ratio.
+        self.delivered         = True
+        self.packets_delivered = 0
 
     def distance_to(self, x: float, y: float) -> float:
         return math.hypot(self.x - x, self.y - y)
@@ -215,13 +279,44 @@ class Node:
         return E_DA * bits * n
 
     def transmit(self, to_x: float, to_y: float) -> bool:
-        cost = self._tx_cost(self._cfg["PACKET_SIZE"],
-                             math.hypot(self.x - to_x, self.y - to_y))
-        self.energy       -= cost
+        """
+        v2 realistic transmit with an ARQ (retransmission) layer.
+        p_drop grows with distance; on a drop the node retries up to MAX_RETX
+        times and EVERY attempt costs full TX energy. self.delivered records
+        whether the packet finally arrived. PACKET_LOSS == 0 reduces exactly to
+        the original loss-free behaviour.
+        """
+        bits = self._cfg["PACKET_SIZE"]
+        d    = math.hypot(self.x - to_x, self.y - to_y)
+        loss = float(self._cfg.get("PACKET_LOSS", 0.0))
+
+        if loss <= 0.0:
+            self.energy       -= self._tx_cost(bits, d)
+            self.packets_sent += 1
+            self.delivered     = True
+            if self.energy <= 0:
+                self.energy = 0
+                self.alive  = False
+            else:
+                self.packets_delivered += 1
+            return self.alive
+
+        d0     = max(float(self._cfg.get("DIRECT_DIST", 55.0)), 1e-9)
+        p_drop = min(0.95, loss * (1.0 + 0.5 * d / d0))
+        max_retx = int(self._cfg.get("MAX_RETX", 0))
         self.packets_sent += 1
-        if self.energy <= 0:
-            self.energy = 0
-            self.alive  = False
+        self.delivered = False
+        for _attempt in range(max_retx + 1):
+            self.energy -= self._tx_cost(bits, d)
+            if self.energy <= 0:
+                self.energy = 0
+                self.alive  = False
+                break
+            if random.random() >= p_drop:
+                self.delivered = True
+                break
+        if self.delivered:
+            self.packets_delivered += 1
         return self.alive
 
     def receive(self) -> bool:
@@ -254,6 +349,19 @@ class Node:
         self.assigned_ms = None
         self.goes_direct = False
 
+    def idle_sense_drain(self) -> None:
+        """v2: every alive node spends a small idle-listen + sensing energy each
+        round regardless of transmitting. Makes solar harvesting genuinely
+        matter (a node must out-harvest its idle cost to survive)."""
+        drain = (float(self._cfg.get("IDLE_ENERGY", 0.0))
+                 + float(self._cfg.get("SENSING_ENERGY", 0.0)))
+        if drain <= 0.0:
+            return
+        self.energy -= drain
+        if self.energy <= 0:
+            self.energy = 0
+            self.alive  = False
+
     @property
     def energy_fraction(self) -> float:
         # Fraction of INITIAL energy remaining. With solar harvesting this can
@@ -282,6 +390,56 @@ def solar_rate_for_round(round_num: int, max_harvest: float) -> float:
         0.0,
         math.sin(math.pi * (hour - 6) / 12)
     )
+
+
+def load_solar_trace(path: str) -> List[float]:
+    """Load a measured solar-harvest trace (one number per line, or comma/space
+    separated) as harvest rate per round. Returns [] on failure."""
+    vals: List[float] = []
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                for tok in line.replace(",", " ").split():
+                    try:
+                        vals.append(float(tok))
+                    except ValueError:
+                        pass
+    except OSError:
+        return []
+    return vals
+
+
+def actual_solar_rate(round_num: int, cfg: dict) -> float:
+    """
+    v2 REALISTIC solar model - what a panel ACTUALLY harvests this round.
+    On top of the clear-sky half-sine we layer: a yearly seasonal envelope
+    (SEASON_AMP), stochastic clouds (CLOUD_PROB down to CLOUD_MIN of clear-sky),
+    and small Gaussian noise. If SOLAR_TRACE is set, that measured series is used
+    verbatim (cycled) and the analytic model is bypassed.
+
+    Design: the GA PLANS on the clear-sky forecast (solar_rate_for_round) but the
+    battery is charged with THIS actual value - modelling the forecast-vs-reality
+    gap a real harvesting controller faces.
+    """
+    trace = cfg.get("_solar_trace_cache")
+    if trace is None and cfg.get("SOLAR_TRACE"):
+        trace = load_solar_trace(cfg["SOLAR_TRACE"])
+        cfg["_solar_trace_cache"] = trace if trace else []
+        trace = cfg["_solar_trace_cache"]
+    if trace:
+        return max(0.0, float(trace[round_num % len(trace)]))
+
+    base = solar_rate_for_round(round_num, cfg["MAX_HARVEST"])
+    if base <= 0.0 or cfg.get("SOLAR_MODEL", "clearsky") != "realistic":
+        return base
+
+    day    = round_num // 24
+    season = 1.0 + cfg.get("SEASON_AMP", 0.0) * math.sin(2 * math.pi * day / 365.0)
+    cloud  = 1.0
+    if random.random() < cfg.get("CLOUD_PROB", 0.0):
+        cloud = random.uniform(cfg.get("CLOUD_MIN", 0.15), 0.85)
+    noise  = random.gauss(1.0, 0.05)
+    return max(0.0, base * season * cloud * noise)
 
 # ==============================================================================
 # SECTION 4 - WORLD STATE
@@ -381,7 +539,7 @@ def _evaluate_population(pop: List["Chromosome"],
 
     e_score = np.minimum(ch_e.sum(axis=1) / (K * cfg["E_INITIAL"]), 1.0)
 
-    if cfg["MAX_HARVEST"] > 0:
+    if cfg["MAX_HARVEST"] > 0 and cfg.get("USE_SOLAR_TERM", True):
         daylight = solar_now / cfg["MAX_HARVEST"]        # 0.0 night, 1.0 noon
 
         # NODE-SPECIFIC solar: scale the shared daylight level by the average
@@ -554,6 +712,9 @@ def run_ga_ch_election(nodes: List[Node],
             stale += 1
             cur_mut = min(0.5, cfg["GA_MUT"] * (1 + stale * 0.25))
 
+        if _CONV_SINK is not None:            # v2 convergence recording
+            _CONV_SINK.append(best_score)
+
         if stale >= PATIENCE:
             break
 
@@ -601,10 +762,12 @@ def decide_ch_paths(ch_nodes: List[Node],
 def _solar_aware_score(ch: Node, peers: List[Node], cfg: dict,
                        solar_now: float) -> float:
     bat = min(ch.energy_fraction, 1.0)
-    if cfg["MAX_HARVEST"] > 0:
+    if cfg["MAX_HARVEST"] > 0 and cfg.get("USE_SOLAR_TERM", True):
         # Node-specific: shared daylight level scaled by THIS candidate's own
         # panel efficiency, so the solar term genuinely differentiates the
         # relay CHs competing to become the MS-CH.
+        # v2: when USE_SOLAR_TERM is False this drops to a neutral constant,
+        # ablating solar-awareness from MS-CH election too.
         solar = (solar_now / cfg["MAX_HARVEST"]) * ch.solar_eff
     else:
         solar = 0.5
@@ -696,12 +859,15 @@ def simulate_round_ga(nodes: List[Node],
                       round_num: int,
                       cfg: dict,
                       stats: dict) -> bool:
-    solar_now = solar_rate_for_round(round_num, cfg["MAX_HARVEST"])
+    solar_now    = solar_rate_for_round(round_num, cfg["MAX_HARVEST"])  # forecast
+    solar_actual = actual_solar_rate(round_num, cfg)                    # realised
 
-    if solar_now > 0:
-        for n in nodes:
-            if n.alive:
-                n.harvest_solar(solar_now)
+    # v2: realistic harvest (clouds/season/noise) + always-on idle/sensing drain.
+    for n in nodes:
+        if n.alive:
+            if solar_actual > 0:
+                n.harvest_solar(solar_actual)
+            n.idle_sense_drain()
 
     for n in nodes:
         if n.alive:
@@ -717,7 +883,10 @@ def simulate_round_ga(nodes: List[Node],
         stats["ms_counts"].append(0)
         return False
 
+    _t0 = time.perf_counter()
     solution = run_ga_ch_election(nodes, world, cfg, round_num, num_chs)
+    stats["elect_time"] += time.perf_counter() - _t0
+    stats["elect_calls"] += 1
     if solution is None:
         _record_stats(nodes, stats)
         stats["ch_counts"].append(0)
@@ -753,7 +922,8 @@ def simulate_round_ga(nodes: List[Node],
             ch = nodes[n.assigned_ch]
             if ch.alive:
                 n.transmit(ch.x, ch.y)
-                ch.receive()
+                if n.delivered:              # RX only if the packet arrived
+                    ch.receive()
 
     member_count: Dict[int, int] = {c.id: 0 for c in ch_nodes}
     for nid in world.alive_idx.tolist():
@@ -775,8 +945,9 @@ def simulate_round_ga(nodes: List[Node],
             ms = nodes[ch.assigned_ms]
             if ms.alive:
                 ch.transmit(ms.x, ms.y)
-                ms.receive()
-                ms_inbound[ms.id] += 1
+                if ch.delivered:            # relay hop only counts if it arrived
+                    ms.receive()
+                    ms_inbound[ms.id] += 1
 
     for ms in list(ms_chs):
         if ms.energy < MS_REELECT_THR * cfg["E_INITIAL"]:
@@ -801,10 +972,11 @@ def simulate_round_ga(nodes: List[Node],
             ms.aggregate(own_members + inbound)
             if ms.alive:
                 ms.transmit(cfg["BS_X"], cfg["BS_Y"])
-                stats["packets_to_bs"] += 1
+                if ms.delivered:                 # count only successful delivery
+                    stats["packets_to_bs"] += 1
 
     for ch in direct_chs:
-        if ch.alive:
+        if ch.alive and ch.delivered:            # delivered set during CH TX
             stats["packets_to_bs"] += 1
 
     _record_stats(nodes, stats)
@@ -835,6 +1007,8 @@ def make_stats() -> dict:
         "ms_counts"     : [],
         "packets_to_bs" : 0,
         "reelections"   : 0,
+        "elect_time"    : 0.0,   # v2: cumulative CH-election wall-clock (s)
+        "elect_calls"   : 0,     # v2: number of CH-election calls
     }
 
 
@@ -1328,7 +1502,6 @@ def plot_topology_montage(cfg: dict, max_tiles: int = 12,
         print(f"  !  No {SNAPSHOT_DIR}/ directory found - montage skipped.")
         return
 
-    # Find snapshot files and parse round numbers from their filenames.
     entries = []
     for fname in os.listdir(SNAPSHOT_DIR):
         if not fname.startswith("ga_round_") or not fname.endswith(".png"):
@@ -1345,7 +1518,6 @@ def plot_topology_montage(cfg: dict, max_tiles: int = 12,
 
     entries.sort(key=lambda t: t[0])
 
-    # Evenly sample up to max_tiles items (keep the first and last).
     if len(entries) > max_tiles:
         idx = np.linspace(0, len(entries) - 1, max_tiles).round().astype(int)
         entries = [entries[i] for i in idx]
@@ -1358,7 +1530,7 @@ def plot_topology_montage(cfg: dict, max_tiles: int = 12,
                              figsize=(cols * 4.2, rows * 4.4),
                              squeeze=False)
     fig.suptitle(
-        "Topology evolution over rounds (GA Solar-Aware Multi-Sink)\n"
+        "Topology evolution over rounds (GA Solar-Aware Multi-Sink, v2)\n"
         f"Nodes={cfg['NUM_NODES']}, Field={cfg['FIELD']}m, "
         f"snapshots every {cfg.get('SNAPSHOT_EVERY', '?')} rounds",
         fontsize=13, fontweight="bold")
@@ -1376,7 +1548,6 @@ def plot_topology_montage(cfg: dict, max_tiles: int = 12,
         ax.set_title(f"Round {rnd}", fontsize=10)
         ax.axis("off")
 
-    # Blank out any unused cells in the last row.
     for j in range(n, rows * cols):
         axes[j // cols][j % cols].axis("off")
 
@@ -1424,7 +1595,8 @@ def print_summary(ga_s, ga_fd, ga_nd, cfg) -> None:
 # MAIN
 # ==============================================================================
 
-def main():
+def run_ga_interactive():
+    """Original interactive GA-only runner (prompts + single seed-42 run)."""
     print("\n" + "#" * 65)
     print("  Solar-Aware GA Multi-Sink Data Aggregation Protocol")
     print("  for Wireless Sensor Assisted IoT  --  GA-ONLY RUNNER")
@@ -1444,5 +1616,342 @@ def main():
     print("\n  All outputs saved.  Done.\n")
 
 
+# ##############################################################################
+# ##   v2 ADDITIONS  -  every previously-listed drawback addressed            ##
+# ##   (GA-only edition: no PSO/GWO/HEED/LEACH; the A/B test is the SOLAR     ##
+# ##    ABLATION - GA with vs without the solar term.)                        ##
+# ##############################################################################
+
+_MC_METRICS = ("lifetime", "first_death", "packets", "residual", "pdr", "elect_ms")
+
+
+# ==============================================================================
+# v2-A  -  SEEDED GA RUN WITH TIMING + PACKET-DELIVERY-RATIO
+# ==============================================================================
+
+def run_ga_protocol(cfg: dict, seed: int = 42, quiet: bool = False):
+    """Run the GA-only protocol for a GIVEN seed. Returns
+    (stats, first_dead, network_dead, extra) where extra carries pdr,
+    avg_elect_ms, tx_attempts, tx_delivered. During quiet (Monte-Carlo) runs
+    topology snapshots are disabled so we don't emit thousands of PNGs."""
+    if quiet:
+        cfg = {**cfg, "SNAPSHOT_EVERY": 0}
+
+    nodes = create_nodes(cfg, seed=seed)
+    world = World(nodes=nodes)
+    stats = make_stats()
+
+    if not quiet:
+        print(f"\n{'=' * 58}")
+        print(f"  GA-only (v2)   seed {seed}")
+        print(f"  Nodes {cfg['NUM_NODES']} | Field {cfg['FIELD']}m | "
+              f"Rounds {cfg['NUM_ROUNDS']} | loss={cfg['PACKET_LOSS']} "
+              f"retx={cfg['MAX_RETX']} | Solar={cfg['SOLAR_MODEL']} "
+              f"| SolarTerm={cfg['USE_SOLAR_TERM']}")
+        print(f"{'=' * 58}")
+
+    first_dead   = None
+    network_dead = cfg["NUM_ROUNDS"]
+    for r in range(cfg["NUM_ROUNDS"]):
+        alive = simulate_round_ga(nodes, world, r, cfg, stats)
+        dead_now = cfg["NUM_NODES"] - sum(1 for n in nodes if n.alive)
+        if first_dead is None and dead_now >= 1:
+            first_dead = r
+            if not quiet:
+                print(f"  *  First node died : round {r}")
+        if not alive:
+            network_dead = r
+            if not quiet:
+                print(f"  X  Network dead    : round {r}")
+            break
+
+    tx = sum(n.packets_sent for n in nodes)
+    ok = sum(n.packets_delivered for n in nodes)
+    pdr = (ok / tx) if tx else 0.0
+    avg_elect_ms = (stats["elect_time"] / stats["elect_calls"] * 1000.0
+                    if stats["elect_calls"] else 0.0)
+    extra = {"pdr": pdr, "avg_elect_ms": avg_elect_ms,
+             "tx_attempts": tx, "tx_delivered": ok}
+
+    if not quiet:
+        if network_dead == cfg["NUM_ROUNDS"]:
+            print(f"  v  Survived all {cfg['NUM_ROUNDS']} rounds")
+        print(f"  Packets to BS   : {stats['packets_to_bs']}")
+        print(f"  PDR             : {pdr * 100:.1f}% ({ok}/{tx} attempts)")
+        print(f"  Avg CH-election : {avg_elect_ms:.2f} ms/round")
+    return stats, first_dead, network_dead, extra
+
+
+def _one_run_metrics(cfg: dict, seed: int) -> Dict[str, float]:
+    stats, fd, nd, extra = run_ga_protocol(cfg, seed=seed, quiet=True)
+    return {
+        "lifetime"   : float(nd),
+        "first_death": float(fd if fd is not None else cfg["NUM_ROUNDS"]),
+        "packets"    : float(stats["packets_to_bs"]),
+        "residual"   : float(stats["total_energy"][-1] if stats["total_energy"] else 0.0),
+        "pdr"        : float(extra["pdr"]),
+        "elect_ms"   : float(extra["avg_elect_ms"]),
+    }
+
+
+# ==============================================================================
+# v2-B  -  STATISTICAL SIGNIFICANCE HELPER
+# ==============================================================================
+
+def _significance(a: List[float], b: List[float]) -> Dict[str, float]:
+    """Welch t-test + Mann-Whitney U via SciPy when available; otherwise a
+    manual Welch t-statistic + Cohen's d (honestly reporting no p-value)."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    try:
+        from scipy import stats as _sp   # type: ignore
+        t, p_t = _sp.ttest_ind(a, b, equal_var=False)
+        try:
+            u, p_u = _sp.mannwhitneyu(a, b, alternative="two-sided")
+        except ValueError:
+            u, p_u = float("nan"), float("nan")
+        return {"backend": "scipy", "t": float(t), "p_ttest": float(p_t),
+                "u": float(u), "p_mwu": float(p_u)}
+    except Exception:
+        na, nb = len(a), len(b)
+        am, bm = float(a.mean()), float(b.mean())
+        av = float(a.var(ddof=1)) if na > 1 else 0.0
+        bv = float(b.var(ddof=1)) if nb > 1 else 0.0
+        se = math.sqrt(av / na + bv / nb) if na and nb else 0.0
+        t  = (am - bm) / se if se > 0 else float("nan")
+        psd = (math.sqrt(((av * (na - 1)) + (bv * (nb - 1))) / (na + nb - 2))
+               if (na + nb - 2) > 0 else 0.0)
+        d = (am - bm) / psd if psd > 0 else float("nan")
+        return {"backend": "manual", "t": float(t), "p_ttest": float("nan"),
+                "cohens_d": float(d)}
+
+
+# ==============================================================================
+# v2-C  -  MONTE-CARLO (MULTI-SEED) EVALUATION OF THE GA
+# ==============================================================================
+
+def run_monte_carlo(cfg: Optional[dict] = None,
+                    seeds: Optional[List[int]] = None) -> Dict[str, tuple]:
+    """Run the GA over many seeds; report mean +/- std for every metric. This is
+    the credibility fix for 'you only ran seed 42'."""
+    if cfg is None:
+        cfg = default_config()
+    if seeds is None:
+        seeds = list(range(1, int(cfg.get("MC_SEEDS", 15)) + 1))
+
+    print("\n" + "#" * 66)
+    print("  MONTE-CARLO EVALUATION  -  GA-only Solar-Aware Multi-Sink (v2)")
+    print(f"  Seeds : {len(seeds)} ({seeds[0]}..{seeds[-1]}) | "
+          f"loss={cfg['PACKET_LOSS']} retx={cfg['MAX_RETX']} | "
+          f"Solar={cfg['SOLAR_MODEL']} | SolarTerm={cfg['USE_SOLAR_TERM']}")
+    print("#" * 66)
+
+    raw: Dict[str, List[float]] = {m: [] for m in _MC_METRICS}
+    for si, seed in enumerate(seeds, 1):
+        print(f"  Seed {si}/{len(seeds)} (={seed}) ...", end="", flush=True)
+        m = _one_run_metrics(cfg, seed)
+        for k in _MC_METRICS:
+            raw[k].append(m[k])
+        print(f" lifetime={m['lifetime']:.0f}, PDR={m['pdr']*100:.0f}%")
+
+    agg: Dict[str, tuple] = {}
+    for m in _MC_METRICS:
+        arr = np.asarray(raw[m], dtype=float)
+        agg[m] = (float(arr.mean()),
+                  float(arr.std(ddof=1)) if arr.size > 1 else 0.0)
+
+    labels = [
+        ("lifetime",    "Network lifetime (rounds)"),
+        ("first_death", "First node death (round)"),
+        ("packets",     "Packets delivered to BS"),
+        ("residual",    "Final residual energy (J)"),
+        ("pdr",         "Packet delivery ratio"),
+        ("elect_ms",    "CH-election time (ms/round)"),
+    ]
+    print("\n  " + "-" * 52)
+    print(f"  {'Metric':<30}{'mean +/- std':>22}")
+    print("  " + "-" * 52)
+    for key, label in labels:
+        mean, std = agg[key]
+        if key == "pdr":
+            print(f"  {label:<30}{mean*100:>15.1f}% +/-{std*100:<5.1f}")
+        elif key in ("residual",):
+            print(f"  {label:<30}{mean:>16.3f} +/-{std:<5.3f}")
+        elif key == "elect_ms":
+            print(f"  {label:<30}{mean:>16.2f} +/-{std:<5.2f}")
+        else:
+            print(f"  {label:<30}{mean:>16.1f} +/-{std:<5.1f}")
+    print("  " + "-" * 52)
+
+    print("  Generating Monte-Carlo plot ...")
+    plot_monte_carlo(agg, cfg)
+    print("\n  Monte-Carlo evaluation done.\n")
+    return agg
+
+
+def plot_monte_carlo(agg: Dict[str, tuple], cfg: dict) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle(
+        f"GA-only Monte-Carlo over {cfg.get('MC_SEEDS', '?')} seeds "
+        f"(mean +/- std)\nrealistic radio (loss/retx) + realistic solar",
+        fontsize=12, fontweight="bold")
+    panels = [
+        ("lifetime", "Network lifetime (rounds)", axes[0, 0], "#1A5FAD"),
+        ("pdr",      "Packet delivery ratio",     axes[0, 1], "#27AE60"),
+        ("packets",  "Packets delivered to BS",   axes[1, 0], "#8E44AD"),
+        ("elect_ms", "CH-election (ms/round)",    axes[1, 1], "#E67E22"),
+    ]
+    for key, title, ax, color in panels:
+        mean, std = agg[key]
+        ax.bar(["GA"], [mean], yerr=[std], capsize=8, color=color, width=0.5)
+        ax.set_title(title)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.text(0, mean, f"{mean:.2f}" if mean < 100 else f"{mean:.0f}",
+                ha="center", va="bottom", fontsize=9)
+    plt.tight_layout()
+    plt.savefig("ga_v2_monte_carlo.png", dpi=150, bbox_inches="tight")
+    print("  Plot saved -> ga_v2_monte_carlo.png")
+    plt.close()
+
+
+# ==============================================================================
+# v2-D  -  CONVERGENCE CURVE (how fast the GA's fitness improves)
+# ==============================================================================
+
+def plot_convergence(cfg: Optional[dict] = None, seed: int = 42) -> None:
+    """Run one CH election and record best-fitness per generation."""
+    global _CONV_SINK
+    if cfg is None:
+        cfg = default_config()
+    nodes = create_nodes(cfg, seed=seed)
+    world = World(nodes=nodes)
+    world.refresh()
+    num_chs = get_num_chs(int(world.alive_idx.size), cfg)
+    _CONV_SINK = []
+    try:
+        run_ga_ch_election(nodes, world, cfg, 12, num_chs)   # round 12 ~ midday
+    finally:
+        curve = list(_CONV_SINK)
+        _CONV_SINK = None
+
+    plt.figure(figsize=(9, 6))
+    if curve:
+        plt.plot(range(1, len(curve) + 1), curve, lw=2, color="#1A5FAD",
+                 marker="o", ms=3, label="GA best fitness")
+    plt.xlabel("Generation")
+    plt.ylabel("Best fitness so far")
+    plt.title("GA convergence (single CH election, midday round)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("ga_v2_convergence.png", dpi=150, bbox_inches="tight")
+    print("  Plot saved -> ga_v2_convergence.png")
+    plt.close()
+
+
+# ==============================================================================
+# v2-E  -  SOLAR-AWARENESS ABLATION  (the GA-only A/B test)
+# ==============================================================================
+
+def run_solar_ablation(cfg: Optional[dict] = None,
+                       seeds: Optional[List[int]] = None) -> Dict[str, dict]:
+    """Run the GA WITH and WITHOUT the solar term over multiple seeds and test
+    whether the 'solar-aware' idea actually changes outcomes."""
+    if cfg is None:
+        cfg = default_config()
+    if seeds is None:
+        seeds = list(range(1, int(cfg.get("MC_SEEDS", 15)) + 1))
+
+    print("\n" + "#" * 66)
+    print("  SOLAR-AWARENESS ABLATION  -  GA with vs without the solar term")
+    print("#" * 66)
+
+    out: Dict[str, dict] = {}
+    for label, use_solar in (("solar-aware", True), ("solar-OFF", False)):
+        c = {**cfg, "USE_SOLAR_TERM": use_solar}
+        lifetimes, pdrs = [], []
+        for seed in seeds:
+            _, _, nd, extra = run_ga_protocol(c, seed=seed, quiet=True)
+            lifetimes.append(float(nd))
+            pdrs.append(float(extra["pdr"]))
+        out[label] = {"lifetime": lifetimes, "pdr": pdrs}
+        print(f"  {label:<12}: lifetime "
+              f"{np.mean(lifetimes):.1f}+/-"
+              f"{np.std(lifetimes, ddof=1) if len(lifetimes) > 1 else 0:.1f}"
+              f" | PDR {np.mean(pdrs) * 100:.1f}%")
+
+    on  = float(np.mean(out["solar-aware"]["lifetime"]))
+    off = float(np.mean(out["solar-OFF"]["lifetime"]))
+    if off > 0:
+        print(f"\n  Solar term changes GA network lifetime by "
+              f"{(on - off) / off * 100:+.1f}% (mean over seeds).")
+        s = _significance(out["solar-aware"]["lifetime"],
+                          out["solar-OFF"]["lifetime"])
+        if s["backend"] == "scipy":
+            sig = ("SIGNIFICANT" if (s["p_ttest"] == s["p_ttest"]
+                                     and s["p_ttest"] < 0.05) else "not sig.")
+            print(f"  Welch t={s['t']:+.2f}, p={s['p_ttest']:.4g} | "
+                  f"Mann-Whitney p={s['p_mwu']:.4g}  -> {sig} (a=0.05)")
+        else:
+            print(f"  Cohen's d={s.get('cohens_d', float('nan')):+.2f} "
+                  f"(install SciPy for a p-value)")
+
+    # Bar plot of lifetime on vs off.
+    plt.figure(figsize=(6, 5))
+    means = [on, off]
+    stds  = [np.std(out["solar-aware"]["lifetime"], ddof=1)
+             if len(seeds) > 1 else 0,
+             np.std(out["solar-OFF"]["lifetime"], ddof=1)
+             if len(seeds) > 1 else 0]
+    plt.bar(["solar-aware", "solar-OFF"], means, yerr=stds, capsize=8,
+            color=["#27AE60", "#C0392B"], width=0.5)
+    plt.ylabel("Network lifetime (rounds)")
+    plt.title("Solar-awareness ablation (mean +/- std)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("ga_v2_ablation.png", dpi=150, bbox_inches="tight")
+    print("  Plot saved -> ga_v2_ablation.png\n")
+    plt.close()
+    return out
+
+
+# ==============================================================================
+# v2 MAIN ENTRY POINT
+# ==============================================================================
+
+def main_v2(cfg: Optional[dict] = None) -> None:
+    """Full GA-only v2 pipeline, each stage removing a prior drawback:
+      1. Monte-Carlo over many seeds (single-seed fix) + CH-election timing
+      2. GA convergence curve (GA-cost visibility)
+      3. Solar-awareness ablation with significance (solar-edge fix)
+    Realistic radio + realistic solar are ON by default."""
+    if cfg is None:
+        cfg = default_config()
+
+    stage = os.environ.get("SOLAR_GA_STAGE", "all").lower()
+    if stage in ("all", "mc", "montecarlo"):
+        run_monte_carlo(cfg)
+    if stage in ("all", "convergence", "conv"):
+        print("  Generating convergence curve ...")
+        plot_convergence(cfg)
+    if stage in ("all", "ablation"):
+        run_solar_ablation(cfg)
+    if stage in ("single",):
+        run_ga_protocol(cfg, seed=42)     # one detailed seed-42 run
+        plot_topology_montage(cfg)        # combine snapshots into ONE figure
+    if stage in ("interactive",):
+        run_ga_interactive()              # original prompt-driven runner
+
+
 if __name__ == "__main__":
-    main()
+    # v2 default: Monte-Carlo + convergence + solar ablation, all with the
+    # realistic radio and solar models. Non-interactive; Colab/CI ready.
+    #
+    #   python ga_only_v2.py
+    #   SOLAR_GA_STAGE=mc          python ga_only_v2.py   # Monte-Carlo only
+    #   SOLAR_GA_STAGE=ablation    python ga_only_v2.py   # ablation only
+    #   SOLAR_GA_STAGE=single      python ga_only_v2.py   # one seed-42 run
+    #   SOLAR_GA_STAGE=interactive python ga_only_v2.py   # original prompts
+    #
+    # Fewer seeds / faster: call main_v2(default_config(MC_SEEDS=5)) yourself.
+    main_v2()
